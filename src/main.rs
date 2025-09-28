@@ -14,6 +14,7 @@ use serde::{Serialize, Deserialize};
 use id3::Tag;
 use id3::TagLike;
 use std::fs::File;
+use teloxide::types::MessageId;
 
 // Queue item structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +237,7 @@ async fn main() {
         let handler = Update::filter_message().endpoint(|bot: Bot, msg: Message, audio_state: Arc<Mutex<AudioState>>| async move {
             let username = msg.from.clone().map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone())).unwrap_or_else(|| "Unknown".to_string());
 
-            let cmd = FasterCommand::parse(msg.text().unwrap_or(""), bot.get_me().await.unwrap().username()).unwrap();
+            let cmd = FasterCommand::parse(msg.text().unwrap_or(""), bot.get_me().await?.username()).unwrap();
             match cmd {
                 FasterCommand::Help => {
                     bot.send_message(msg.chat.id, FasterCommand::descriptions().to_string()).await?;
@@ -246,9 +247,14 @@ async fn main() {
                     bot.send_message(msg.chat.id, state.get_queue_info()).await?;
                 }
                 FasterCommand::Play(url) => {
-                    bot.send_message(msg.chat.id, "Downloading audio...").await?;
-                    
-                    match download_audio(&url).await {
+                    let msg_handle = bot.send_message(msg.chat.id, "Downloading audio...").await?;
+
+                    match download_audio_with_progress(
+                        bot.clone(),
+                        msg.chat.id,
+                        msg_handle.id,
+                        &url,
+                    ).await {
                         Ok((audio_data, title, duration)) => {
                             let mut state = audio_state.lock().await;
                             
@@ -285,8 +291,7 @@ async fn main() {
                             }
                         }
                         Err(e) => {
-                            bot.send_message(msg.chat.id, format!("Error downloading audio: {}", e)).await?;
-                            error!("Error downloading audio: {}", e);
+                            bot.edit_message_text(msg.chat.id, msg_handle.id, format!("Error: {}", e)).await?;
                         }
                     }
                 }
@@ -404,7 +409,12 @@ enum FasterCommand {
     NowPlaying,
 }
 
-async fn download_audio(url: &str) -> Result<(Vec<u8>, String, Option<Duration>), String> {
+async fn download_audio_with_progress(
+    bot: Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    url: &str,
+) -> Result<(Vec<u8>, String, Option<Duration>), String> {
     let url = url.to_string();
     
     tokio::task::spawn_blocking(move || {
@@ -423,15 +433,36 @@ async fn download_audio(url: &str) -> Result<(Vec<u8>, String, Option<Duration>)
                 let url_hash = hex::encode(&hasher.finalize()[..]);
 
                 // Download video
-                let video_path = fetcher
-                    .download_video_from_url(url, format!("{url_hash}.mp4"))
+                let video_path = format!("/tmp/{url_hash}.mp4");
+                let video = fetcher.fetch_video_infos(url).await.expect("Failed to fetch video data");
+                let bot_copy = bot.clone();
+                let download_id = fetcher
+                    .download_video_with_progress(&video, &video_path, move |downloaded, total| {
+                        let percent = if total > 0 {
+                            (downloaded as f64 / total as f64 * 100.0) as u64
+                        } else {
+                            0
+                        };
+                        let text = format!("Downloading... {:.1}% complete", percent);
+
+                        let bot = bot_copy.clone();
+                        let chat_id = chat_id;
+                        let message_id = message_id;
+                        tokio::spawn(async move {
+                            match bot.edit_message_text(chat_id, message_id, text).await {
+                                Ok(_) => {},
+                                Err(e) => error!("Failed to update download percent: {}", e)
+                            }
+                        });
+                    })
                     .await
                     .map_err(|e| e.to_string())?;
+                fetcher.wait_for_download(download_id).await;
 
-                let audio_path = format!("{url_hash}.mp3");
+                let audio_path = format!("/tmp/{url_hash}.mp3");
 
                 let status = std::process::Command::new("ffmpeg")
-                    .args(&["-i", video_path.to_str().expect("non utf-8 characters in path"), "-q:a", "0", "-map", "a", &audio_path])
+                    .args(&["-i", &video_path.to_string(), "-q:a", "0", "-map", "a", &audio_path])
                     .status()
                     .map_err(|e| e.to_string())?;
 
@@ -466,6 +497,10 @@ async fn download_audio(url: &str) -> Result<(Vec<u8>, String, Option<Duration>)
 
                 // Clean up downloaded files
                 let _ = std::fs::remove_file(audio_path);
+
+                let _ = bot
+                    .edit_message_text(chat_id, message_id, "Download complete! Added to queue.")
+                    .await;
 
                 Ok((audio_data, title, duration))
             })
