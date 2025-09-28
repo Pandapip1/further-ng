@@ -32,7 +32,6 @@ struct AudioState {
     sink: Option<Sink>,
     _stream: Option<OutputStream>,
     queue: Vec<QueueItem>,
-    current_index: Option<usize>,
     is_playing: bool,
 }
 
@@ -47,7 +46,6 @@ impl AudioState {
             sink: Some(sink),
             _stream: Some(stream_handle),
             queue: Vec::new(),
-            current_index: None,
             is_playing: false,
         })
     }
@@ -58,24 +56,13 @@ impl AudioState {
     }
 
     fn play_next(&mut self) -> Result<Option<QueueItem>, String> {
-        // If we're at the end of the queue, stop
-        if let Some(current_idx) = self.current_index {
-            if current_idx + 1 >= self.queue.len() {
-                self.stop();
-                self.current_index = None;
-                self.is_playing = false;
-                return Ok(None);
-            }
-            
-            self.current_index = Some(current_idx + 1);
-        } else if !self.queue.is_empty() {
-            self.current_index = Some(0);
-        } else {
+        if self.queue.is_empty() {
+            self.stop();
+            self.is_playing = false;
             return Ok(None);
-        }
-
-        if let Some(current_idx) = self.current_index {
-            if let Some(item) = self.queue.get(current_idx) {
+        } else {
+            self.queue.remove(0);
+            if let Some(item) = self.queue.get(0) {
                 let item_clone = item.clone();
                 self.play_audio(item.audio_data.clone())?;
                 self.is_playing = true;
@@ -122,25 +109,23 @@ impl AudioState {
     fn clear_queue(&mut self) {
         self.queue.clear();
         self.stop();
-        self.current_index = None;
     }
 
     fn remove_from_queue(&mut self, index: usize) -> Option<QueueItem> {
         if index < self.queue.len() {
-            let item = self.queue.remove(index);
-            
             // Adjust current index if needed
-            if let Some(current_idx) = self.current_index {
-                if index == current_idx {
-                    // Currently playing item was removed
-                    self.stop();
-                    self.current_index = None;
-                } else if index < current_idx {
-                    self.current_index = Some(current_idx - 1);
+            if index == 0 {
+                let old_itm = self.queue.get(0);
+                if let Some(item) = old_itm {
+                    let itm_clone = item.clone();
+                    let _ = self.play_next();
+                    Some(itm_clone)
+                } else {
+                    None
                 }
+            } else {
+                Some(self.queue.remove(index))
             }
-            
-            Some(item)
         } else {
             None
         }
@@ -158,7 +143,7 @@ impl AudioState {
         let mut info = format!("Queue ({} items):\n", self.queue.len());
         
         for (i, item) in self.queue.iter().enumerate() {
-            let current_indicator = if Some(i) == self.current_index { "▶ " } else { "  " };
+            let current_indicator = if Some(i) == Some(0) { "▶ " } else { "  " };
             let duration_str = item.duration
                 .map(|d| format!("[{:02}:{:02}]", d.as_secs() / 60, d.as_secs() % 60))
                 .unwrap_or_else(|| "[??:??]".to_string());
@@ -171,7 +156,7 @@ impl AudioState {
     }
 
     fn get_current_item(&self) -> Option<&QueueItem> {
-        self.current_index.and_then(|idx| self.queue.get(idx))
+        self.queue.get(0)
     }
 
     fn is_playing(&self) -> bool {
