@@ -1,20 +1,38 @@
 use teloxide::{prelude::*, utils::command::BotCommands, respond};
 use libsystemd::daemon::{self, NotifyState};
 use log::{debug, info, warn, error};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use clap::{Parser, ArgAction};
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, Source, OutputStream, Sink};
 use yt_dlp::Youtube;
 use std::path::PathBuf;
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use sha3::{Sha3_256, Digest};
+use serde::{Serialize, Deserialize};
+use id3::Tag;
+use id3::TagLike;
+use std::fs::File;
 
-// Global state for audio playback
+// Queue item structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueueItem {
+    url: String,
+    title: String,
+    duration: Option<Duration>,
+    added_by: String,
+    added_at: SystemTime,
+    audio_data: Vec<u8>,
+}
+
+// Enhanced audio state with queue management
 struct AudioState {
     sink: Option<Sink>,
     _stream: Option<OutputStream>,
+    queue: Vec<QueueItem>,
+    current_index: Option<usize>,
+    is_playing: bool,
 }
 
 impl AudioState {
@@ -27,13 +45,53 @@ impl AudioState {
         Ok(Self {
             sink: Some(sink),
             _stream: Some(stream_handle),
+            queue: Vec::new(),
+            current_index: None,
+            is_playing: false,
         })
     }
 
-    fn play_audio(&self, data: Vec<u8>) -> Result<(), String> {
+    fn add_to_queue(&mut self, item: QueueItem) -> usize {
+        self.queue.push(item);
+        self.queue.len()
+    }
+
+    fn play_next(&mut self) -> Result<Option<QueueItem>, String> {
+        // If we're at the end of the queue, stop
+        if let Some(current_idx) = self.current_index {
+            if current_idx + 1 >= self.queue.len() {
+                self.stop();
+                self.current_index = None;
+                self.is_playing = false;
+                return Ok(None);
+            }
+            
+            self.current_index = Some(current_idx + 1);
+        } else if !self.queue.is_empty() {
+            self.current_index = Some(0);
+        } else {
+            return Ok(None);
+        }
+
+        if let Some(current_idx) = self.current_index {
+            if let Some(item) = self.queue.get(current_idx) {
+                let item_clone = item.clone();
+                self.play_audio(item.audio_data.clone())?;
+                self.is_playing = true;
+                return Ok(Some(item_clone));
+            }
+        }
+        
+        Ok(None)
+    }
+
+    fn play_audio(&mut self, data: Vec<u8>) -> Result<(), String> {
         if let Some(sink) = &self.sink {
             let cursor = Cursor::new(data);
             let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
+            
+            // Clear any existing audio and play new one
+            sink.stop();
             sink.append(source);
             Ok(())
         } else {
@@ -41,10 +99,11 @@ impl AudioState {
         }
     }
 
-    fn stop(&self) {
+    fn stop(&mut self) {
         if let Some(sink) = &self.sink {
             sink.stop();
         }
+        self.is_playing = false;
     }
 
     fn pause(&self) {
@@ -59,19 +118,96 @@ impl AudioState {
         }
     }
 
-    fn clear(&self) {
-        if let Some(sink) = &self.sink {
-            sink.clear();
+    fn clear_queue(&mut self) {
+        self.queue.clear();
+        self.stop();
+        self.current_index = None;
+    }
+
+    fn remove_from_queue(&mut self, index: usize) -> Option<QueueItem> {
+        if index < self.queue.len() {
+            let item = self.queue.remove(index);
+            
+            // Adjust current index if needed
+            if let Some(current_idx) = self.current_index {
+                if index == current_idx {
+                    // Currently playing item was removed
+                    self.stop();
+                    self.current_index = None;
+                } else if index < current_idx {
+                    self.current_index = Some(current_idx - 1);
+                }
+            }
+            
+            Some(item)
+        } else {
+            None
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.sink.as_ref().map(|s| s.empty()).unwrap_or(true)
+    fn skip_current(&mut self) -> Result<Option<QueueItem>, String> {
+        self.play_next()
     }
 
-    fn len(&self) -> usize {
-        self.sink.as_ref().map(|s| s.len()).unwrap_or(0)
+    fn get_queue_info(&self) -> String {
+        if self.queue.is_empty() {
+            return "Queue is empty".to_string();
+        }
+
+        let mut info = format!("Queue ({} items):\n", self.queue.len());
+        
+        for (i, item) in self.queue.iter().enumerate() {
+            let current_indicator = if Some(i) == self.current_index { "▶ " } else { "  " };
+            let duration_str = item.duration
+                .map(|d| format!("[{:02}:{:02}]", d.as_secs() / 60, d.as_secs() % 60))
+                .unwrap_or_else(|| "[??:??]".to_string());
+            
+            info.push_str(&format!("{}{}. {} {} - added by {}\n", 
+                current_indicator, i + 1, duration_str, item.title, item.added_by));
+        }
+        
+        info
     }
+
+    fn get_current_item(&self) -> Option<&QueueItem> {
+        self.current_index.and_then(|idx| self.queue.get(idx))
+    }
+
+    fn is_playing(&self) -> bool {
+        self.is_playing
+    }
+
+    fn queue_length(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+// Set up event handling for when audio finishes
+fn setup_audio_completion_handler(audio_state: Arc<Mutex<AudioState>>, _bot: Bot) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        
+        loop {
+            interval.tick().await;
+            
+            let should_play_next = {
+                let state = audio_state.lock().await;
+                state.is_playing() && state.sink.as_ref().map(|s| s.empty()).unwrap_or(true)
+            };
+            
+            if should_play_next {
+                let next_item = {
+                    let mut state = audio_state.lock().await;
+                    state.play_next()
+                };
+                
+                if let Ok(Some(item)) = next_item {
+                    // You could send a notification about the next track playing
+                    debug!("Now playing: {}", item.title);
+                }
+            }
+        }
+    });
 }
 
 #[tokio::main]
@@ -89,12 +225,16 @@ async fn main() {
     let bot = Bot::from_env();
     let audio_state = Arc::new(Mutex::new(AudioState::new().expect("Failed to initialize audio state")));
 
+    // Set up audio completion handler
+    setup_audio_completion_handler(audio_state.clone(), bot.clone());
+
     check_state(bot.clone(), NotifyState::Ready, args.clone()).await;
     info!("Bot is connected to Telegram API");
 
     let watchdog_task = tokio::spawn(watchdog(bot.clone(), args.clone()));
     let repl_task = {
         let handler = Update::filter_message().endpoint(|bot: Bot, msg: Message, audio_state: Arc<Mutex<AudioState>>| async move {
+            let username = msg.from.clone().map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone())).unwrap_or_else(|| "Unknown".to_string());
 
             let cmd = FasterCommand::parse(msg.text().unwrap_or(""), bot.get_me().await.unwrap().username()).unwrap();
             match cmd {
@@ -103,34 +243,55 @@ async fn main() {
                 }
                 FasterCommand::Queue => {
                     let state = audio_state.lock().await;
-                    if state.is_empty() {
-                        bot.send_message(msg.chat.id, "Queue is empty").await?;
-                    } else {
-                        bot.send_message(msg.chat.id, format!("Queue length: {}", state.len())).await?;
-                    }
+                    bot.send_message(msg.chat.id, state.get_queue_info()).await?;
                 }
                 FasterCommand::Play(url) => {
                     bot.send_message(msg.chat.id, "Downloading audio...").await?;
                     
                     match download_audio(&url).await {
-                        Ok(audio_data) => {
-                            let state = audio_state.lock().await;
-                            match state.play_audio(audio_data) {
-                                Ok(()) => {
-                                    bot.send_message(msg.chat.id, "Now playing!").await?;
+                        Ok((audio_data, title, duration)) => {
+                            let mut state = audio_state.lock().await;
+                            
+                            let item = QueueItem {
+                                url: url.clone(),
+                                title,
+                                duration,
+                                added_by: username,
+                                added_at: SystemTime::now(),
+                                audio_data: audio_data.clone(),
+                            };
+                            
+                            let position = state.add_to_queue(item);
+                            
+                            // If nothing is currently playing, start playback
+                            if !state.is_playing() {
+                                match state.play_next() {
+                                    Ok(Some(item)) => {
+                                        bot.send_message(msg.chat.id, format!("Added to queue (#{}). Now playing: {}", position, item.title)).await?;
+                                        info!("Added to queue (#{}). Now playing: {}", position, item.title);
+                                    }
+                                    Ok(None) => {
+                                        bot.send_message(msg.chat.id, format!("Added to queue (#{})", position)).await?;
+                                        info!("Added to queue (#{})", position);
+                                    }
+                                    Err(e) => {
+                                        bot.send_message(msg.chat.id, format!("Error playing audio: {}", e)).await?;
+                                        error!("Error playing audio: {}", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    bot.send_message(msg.chat.id, format!("Error playing audio: {}", e)).await?;
-                                }
+                            } else {
+                                bot.send_message(msg.chat.id, format!("Added to queue at position #{}", position)).await?;
+                                info!("Added to queue at position #{}", position)
                             }
                         }
                         Err(e) => {
                             bot.send_message(msg.chat.id, format!("Error downloading audio: {}", e)).await?;
+                            error!("Error downloading audio: {}", e);
                         }
                     }
                 }
                 FasterCommand::Stop => {
-                    let state = audio_state.lock().await;
+                    let mut state = audio_state.lock().await;
                     state.stop();
                     bot.send_message(msg.chat.id, "Playback stopped").await?;
                 }
@@ -145,18 +306,49 @@ async fn main() {
                     bot.send_message(msg.chat.id, "Playback resumed").await?;
                 }
                 FasterCommand::Clear => {
-                    let state = audio_state.lock().await;
-                    state.clear();
+                    let mut state = audio_state.lock().await;
+                    state.clear_queue();
                     bot.send_message(msg.chat.id, "Queue cleared").await?;
                 }
-                FasterCommand::Info => {
-                    let state = audio_state.lock().await;
-                    let info = if state.is_empty() {
-                        "No audio playing".to_string()
+                FasterCommand::Skip => {
+                    let mut state = audio_state.lock().await;
+                    match state.skip_current() {
+                        Ok(Some(item)) => {
+                            bot.send_message(msg.chat.id, format!("Skipped! Now playing: {}", item.title)).await?;
+                        }
+                        Ok(None) => {
+                            bot.send_message(msg.chat.id, "Skipped! Queue is now empty.").await?;
+                        }
+                        Err(e) => {
+                            bot.send_message(msg.chat.id, format!("Error skipping: {}", e)).await?;
+                        }
+                    }
+                }
+                FasterCommand::Remove(index) => {
+                    let mut state = audio_state.lock().await;
+                    if index == 0 || index > state.queue_length() {
+                        bot.send_message(msg.chat.id, "Invalid queue position").await?;
                     } else {
-                        format!("Queue length: {}", state.len())
-                    };
-                    bot.send_message(msg.chat.id, info).await?;
+                        if let Some(removed_item) = state.remove_from_queue(index - 1) {
+                            bot.send_message(msg.chat.id, format!("Removed: {}", removed_item.title)).await?;
+                        } else {
+                            bot.send_message(msg.chat.id, "Failed to remove item").await?;
+                        }
+                    }
+                }
+                FasterCommand::NowPlaying => {
+                    let state = audio_state.lock().await;
+                    if let Some(item) = state.get_current_item() {
+                        let duration_str = item.duration
+                            .map(|d| format!("{:02}:{:02}", d.as_secs() / 60, d.as_secs() % 60))
+                            .unwrap_or_else(|| "??:??".to_string());
+                        
+                        bot.send_message(msg.chat.id, 
+                            format!("Now Playing: {}\nDuration: {}\nAdded by: {}", 
+                            item.title, duration_str, item.added_by)).await?;
+                    } else {
+                        bot.send_message(msg.chat.id, "Nothing is currently playing").await?;
+                    }
                 }
             };
 
@@ -185,6 +377,101 @@ async fn main() {
     }
 
     info!("Main program is exiting.");
+}
+
+#[derive(BotCommands, Debug, Clone)]
+#[command(rename_rule = "lowercase")]
+enum FasterCommand {
+    #[command(aliases = ["h", "?"])]
+    Help,
+    #[command(alias = "q")]
+    Queue,
+    #[command(alias = "p")]
+    Play(String),
+    #[command(alias = "s")]
+    Stop,
+    #[command(alias = "pa")]
+    Pause,
+    #[command(alias = "r")]
+    Resume,
+    #[command(alias = "c")]
+    Clear,
+    #[command(alias = "sk")]
+    Skip,
+    #[command(alias = "rm")]
+    Remove(usize),
+    #[command(alias = "np")]
+    NowPlaying,
+}
+
+async fn download_audio(url: &str) -> Result<(Vec<u8>, String, Option<Duration>), String> {
+    let url = url.to_string();
+    
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Runtime::new()
+            .expect("Failed to create runtime")
+            .block_on(async move {
+                let executables_dir = PathBuf::from("libs");
+                let output_dir = PathBuf::from("/tmp/further-ng-cache");
+                let mut fetcher = Youtube::with_new_binaries(executables_dir, output_dir)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                fetcher.with_timeout(Duration::from_secs(600));
+
+                let mut hasher = Sha3_256::default();
+                hasher.update(&url);
+                let url_hash = hex::encode(&hasher.finalize()[..]);
+
+                // Download video
+                let video_path = fetcher
+                    .download_video_from_url(url, format!("{url_hash}.mp4"))
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let audio_path = format!("{url_hash}.mp3");
+
+                let status = std::process::Command::new("ffmpeg")
+                    .args(&["-i", video_path.to_str().expect("non utf-8 characters in path"), "-q:a", "0", "-map", "a", &audio_path])
+                    .status()
+                    .map_err(|e| e.to_string())?;
+
+                if !status.success() {
+                    return Err("Failed to extract audio from video".to_string());
+                }
+
+                // Read the audio file into a vector
+                let audio_data = match std::fs::read(&audio_path) {
+                    Ok(data) => data,
+                    Err(e) => return Err(e.to_string()),
+                };
+
+                // Extract the title from the MP3 file using ID3 tags
+                let title = match Tag::read_from_path(&audio_path) {
+                    Ok(tag) => tag.title().unwrap_or_else(|| "Unknown Title").to_owned(),
+                    Err(_) => "Unknown Title".to_owned(),
+                };
+
+                // Calculate the duration using rodio
+                let file = match File::open(&audio_path) {
+                    Ok(f) => f,
+                    Err(_) => return Err("Failed to open audio file".to_string()),
+                };
+
+                let decoder = match Decoder::new(std::io::BufReader::new(file)) {
+                    Ok(d) => d,
+                    Err(_) => return Err("Failed to decode audio".to_string()),
+                };
+
+                let duration = decoder.total_duration();
+
+                // Clean up downloaded files
+                let _ = std::fs::remove_file(audio_path);
+
+                Ok((audio_data, title, duration))
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn report_state(state: NotifyState, args: Args) {
@@ -229,76 +516,4 @@ async fn watchdog(bot: Bot, args: Args) {
 struct Args {
     #[clap(long = "no-systemd", action=ArgAction::SetFalse)]
     systemd: bool,
-}
-
-#[derive(BotCommands, Debug, Clone)]
-#[command(rename_rule = "lowercase")]
-enum FasterCommand {
-    #[command(aliases = ["h", "?"])]
-    Help,
-    #[command(alias = "q")]
-    Queue,
-    #[command(alias = "p")]
-    Play(String),
-    #[command(alias = "s")]
-    Stop,
-    #[command(alias = "pa")]
-    Pause,
-    #[command(alias = "r")]
-    Resume,
-    #[command(alias = "c")]
-    Clear,
-    #[command(alias = "i")]
-    Info,
-}
-
-async fn download_audio(url: &str) -> Result<Vec<u8>, String> {
-    let url = url.to_string();
-    
-    // Use spawn_blocking to isolate the non-Send operations
-    tokio::task::spawn_blocking(move || {
-        tokio::runtime::Runtime::new()
-            .expect("Failed to create runtime")
-            .block_on(async move {
-                let executables_dir = PathBuf::from("libs");
-                let output_dir = PathBuf::from("output");
-                let fetcher = Youtube::with_new_binaries(executables_dir, output_dir)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Create hash for the URL
-                let mut hasher = Sha3_256::default();
-                hasher.update(&url);
-                let url_hash = hex::encode(&hasher.finalize()[..]);
-
-                // Download video
-                let video_path = fetcher
-                    .download_video_from_url(url, format!("{url_hash}.mp4"))
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Extract audio from the video using ffmpeg
-                let audio_path = format!("{url_hash}.mp3");
-
-                let status = std::process::Command::new("ffmpeg")
-                    .args(&["-i", video_path.to_str().expect("non utf-8 characters in path"), "-q:a", "0", "-map", "a", &audio_path])
-                    .status()
-                    .map_err(|e| e.to_string())?;
-
-                if !status.success() {
-                    return Err("Failed to extract audio from video".to_string());
-                }
-
-                // Read the audio file into memory
-                let audio_data = std::fs::read(&audio_path).map_err(|e| e.to_string())?;
-
-                // Clean up temporary files
-                let _ = std::fs::remove_file(video_path);
-                let _ = std::fs::remove_file(audio_path);
-
-                Ok(audio_data)
-            })
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }

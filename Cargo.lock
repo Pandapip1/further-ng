@@ -770,9 +770,11 @@ dependencies = [
  "clap",
  "env_logger",
  "hex",
+ "id3",
  "libsystemd",
  "log",
  "rodio",
+ "serde",
  "sha3",
  "teloxide",
  "tokio",
@@ -1222,6 +1224,7 @@ dependencies = [
  "bitflags 2.9.4",
  "byteorder",
  "flate2",
+ "tokio",
 ]
 
 [[package]]
