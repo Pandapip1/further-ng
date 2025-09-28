@@ -1,0 +1,17 @@
+[package]
+name = "further-ng"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rodio = "0.21.1"
+teloxide = { version = "0.17.0", features = ["macros"] }
+log = { version = "0.4", features = [] }
+tokio = { version =  "1.8", features = ["rt-multi-thread", "macros"] }
+libsystemd = "0.7.2"
+yt-dlp = { version = "1.3.4", features = ["rustls"] }
+clap = { version = "4.5.32", features = ["derive"] }
+env_logger = "0.11.8"
+sha3 = "0.10.8"
+tokio-stream = "0.1.17"
+hex = "0.4.3"
