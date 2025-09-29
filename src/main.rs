@@ -1,6 +1,5 @@
 use teloxide::{prelude::*, utils::command::BotCommands, respond};
-use libsystemd::daemon::{self, NotifyState};
-use log::{debug, info, warn, error};
+use log::{debug, info, error};
 use std::time::{Duration, SystemTime};
 use clap::{Parser, ArgAction};
 use yt_dlp::Youtube;
@@ -16,6 +15,9 @@ use rodio::{Decoder, Source};
 
 mod audio_queue;
 use audio_queue::{AudioQueue, QueueItem};
+
+mod systemd_utils;
+use systemd_utils::{SystemdNotifier, SystemdState, watchdog};
 
 // Set up event handling for when audio finishes
 fn setup_audio_completion_handler(audio_queue: Arc<Mutex<AudioQueue>>, _bot: Bot) {
@@ -50,8 +52,9 @@ async fn main() {
     env_logger::init();
 
     let args = Args::parse();
+    let systemd_notifier = SystemdNotifier::new(args.systemd);
 
-    if args.systemd && !daemon::booted() {
+    if args.systemd && !systemd_notifier.is_booted() {
         panic!("Not running systemd, early exit");
     }
 
@@ -63,10 +66,10 @@ async fn main() {
     // Set up audio completion handler
     setup_audio_completion_handler(audio_queue.clone(), bot.clone());
 
-    check_state(bot.clone(), NotifyState::Ready, args.clone()).await;
+    systemd_notifier.check_state(bot.clone(), SystemdState::Ready).await;
     info!("Bot is connected to Telegram API");
 
-    let watchdog_task = tokio::spawn(watchdog(bot.clone(), args.clone()));
+    let watchdog_task = tokio::spawn(watchdog(bot.clone(), systemd_notifier.clone()));
     let repl_task = {
         let handler = Update::filter_message().endpoint(|bot: Bot, msg: Message, audio_queue: Arc<Mutex<AudioQueue>>| async move {
             let username = msg.from.clone().map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone())).unwrap_or_else(|| "Unknown".to_string());
@@ -207,11 +210,11 @@ async fn main() {
     tokio::select! {
         _ = watchdog_task => {
             debug!("watchdog_task has finished");
-            report_state(NotifyState::Stopping, args).await;
+            systemd_notifier.report_state(SystemdState::Stopping).await;
         }
         _ = repl_task => {
             debug!("repl_task has finished");
-            report_state(NotifyState::Stopping, args).await;
+            systemd_notifier.report_state(SystemdState::Stopping).await;
         }
     }
 
@@ -341,43 +344,6 @@ async fn download_audio_with_progress(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-async fn report_state(state: NotifyState, args: Args) {
-    if !args.systemd {
-        return;
-    }
-    match daemon::notify(true, &[state.clone()]) {
-        Ok(true) => {},
-        Ok(false) => warn!("Systemd not notified: {}?", state),
-        Err(e) => warn!("Failed to notify systemd: {}: {}", state, e),
-    }
-}
-
-async fn check_state(bot: Bot, state: NotifyState, args: Args) {
-    match bot.get_me().await {
-        Ok(_) => report_state(state, args).await,
-        Err(e) => {
-            error!("Failed to connect to Telegram API: {}", e);
-            report_state(NotifyState::Errno(1), args).await;
-            panic!();
-        }
-    }
-}
-
-async fn watchdog(bot: Bot, args: Args) {
-    let watchdog_duration = if args.systemd {
-        daemon::watchdog_enabled(false).unwrap_or_else(|| Duration::MAX)
-    } else {
-        Duration::MAX
-    };
-
-    let mut watchdog_timer = tokio::time::interval(watchdog_duration);
-
-    loop {
-        watchdog_timer.tick().await;
-        check_state(bot.clone(), NotifyState::Watchdog, args.clone()).await;
-    }
 }
 
 #[derive(Parser, Debug, Clone)]
