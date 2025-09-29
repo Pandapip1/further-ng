@@ -3,173 +3,22 @@ use libsystemd::daemon::{self, NotifyState};
 use log::{debug, info, warn, error};
 use std::time::{Duration, SystemTime};
 use clap::{Parser, ArgAction};
-use rodio::{Decoder, Source, OutputStream, Sink};
 use yt_dlp::Youtube;
 use std::path::PathBuf;
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use sha3::{Sha3_256, Digest};
-use serde::{Serialize, Deserialize};
 use id3::Tag;
 use id3::TagLike;
 use std::fs::File;
 use teloxide::types::MessageId;
+use rodio::{Decoder, Source};
 
-// Queue item structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QueueItem {
-    url: String,
-    title: String,
-    duration: Option<Duration>,
-    added_by: String,
-    added_at: SystemTime,
-    audio_data: Vec<u8>,
-}
-
-// Enhanced audio state with queue management
-struct AudioState {
-    sink: Option<Sink>,
-    _stream: Option<OutputStream>,
-    queue: Vec<QueueItem>,
-    is_playing: bool,
-}
-
-impl AudioState {
-    fn new() -> Result<Self, String> {
-        let stream_handle = rodio::OutputStreamBuilder::open_default_stream()
-            .map_err(|e| format!("Failed to open default audio stream: {}", e))?;
-
-        let sink = rodio::Sink::connect_new(&stream_handle.mixer());
-
-        Ok(Self {
-            sink: Some(sink),
-            _stream: Some(stream_handle),
-            queue: Vec::new(),
-            is_playing: false,
-        })
-    }
-
-    fn add_to_queue(&mut self, item: QueueItem) -> usize {
-        self.queue.push(item);
-        self.queue.len()
-    }
-
-    fn play_next(&mut self) -> Result<Option<QueueItem>, String> {
-        if self.queue.is_empty() {
-            self.stop();
-            self.is_playing = false;
-            return Ok(None);
-        } else {
-            self.queue.remove(0);
-            if let Some(item) = self.queue.get(0) {
-                let item_clone = item.clone();
-                self.play_audio(item.audio_data.clone())?;
-                self.is_playing = true;
-                return Ok(Some(item_clone));
-            }
-        }
-        
-        Ok(None)
-    }
-
-    fn play_audio(&mut self, data: Vec<u8>) -> Result<(), String> {
-        if let Some(sink) = &self.sink {
-            let cursor = Cursor::new(data);
-            let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
-            
-            // Clear any existing audio and play new one
-            sink.stop();
-            sink.append(source);
-            Ok(())
-        } else {
-            Err("Audio output not available".to_string())
-        }
-    }
-
-    fn stop(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.stop();
-        }
-        self.is_playing = false;
-    }
-
-    fn pause(&self) {
-        if let Some(sink) = &self.sink {
-            sink.pause();
-        }
-    }
-
-    fn resume(&self) {
-        if let Some(sink) = &self.sink {
-            sink.play();
-        }
-    }
-
-    fn clear_queue(&mut self) {
-        self.queue.clear();
-        self.stop();
-    }
-
-    fn remove_from_queue(&mut self, index: usize) -> Option<QueueItem> {
-        if index < self.queue.len() {
-            // Adjust current index if needed
-            if index == 0 {
-                let old_itm = self.queue.get(0);
-                if let Some(item) = old_itm {
-                    let itm_clone = item.clone();
-                    let _ = self.play_next();
-                    Some(itm_clone)
-                } else {
-                    None
-                }
-            } else {
-                Some(self.queue.remove(index))
-            }
-        } else {
-            None
-        }
-    }
-
-    fn skip_current(&mut self) -> Result<Option<QueueItem>, String> {
-        self.play_next()
-    }
-
-    fn get_queue_info(&self) -> String {
-        if self.queue.is_empty() {
-            return "Queue is empty".to_string();
-        }
-
-        let mut info = format!("Queue ({} items):\n", self.queue.len());
-        
-        for (i, item) in self.queue.iter().enumerate() {
-            let current_indicator = if Some(i) == Some(0) { "▶ " } else { "  " };
-            let duration_str = item.duration
-                .map(|d| format!("[{:02}:{:02}]", d.as_secs() / 60, d.as_secs() % 60))
-                .unwrap_or_else(|| "[??:??]".to_string());
-            
-            info.push_str(&format!("{}{}. {} {} - added by {}\n", 
-                current_indicator, i + 1, duration_str, item.title, item.added_by));
-        }
-        
-        info
-    }
-
-    fn get_current_item(&self) -> Option<&QueueItem> {
-        self.queue.get(0)
-    }
-
-    fn is_playing(&self) -> bool {
-        self.is_playing
-    }
-
-    fn queue_length(&self) -> usize {
-        self.queue.len()
-    }
-}
+mod audio_queue;
+use audio_queue::{AudioQueue, QueueItem};
 
 // Set up event handling for when audio finishes
-fn setup_audio_completion_handler(audio_state: Arc<Mutex<AudioState>>, _bot: Bot) {
+fn setup_audio_completion_handler(audio_queue: Arc<Mutex<AudioQueue>>, _bot: Bot) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         
@@ -177,14 +26,14 @@ fn setup_audio_completion_handler(audio_state: Arc<Mutex<AudioState>>, _bot: Bot
             interval.tick().await;
             
             let should_play_next = {
-                let state = audio_state.lock().await;
-                state.is_playing() && state.sink.as_ref().map(|s| s.empty()).unwrap_or(true)
+                let queue = audio_queue.lock().await;
+                queue.is_playing() && queue.sink_ran_out()
             };
             
             if should_play_next {
                 let next_item = {
-                    let mut state = audio_state.lock().await;
-                    state.play_next()
+                    let mut queue = audio_queue.lock().await;
+                    queue.play_next()
                 };
                 
                 if let Ok(Some(item)) = next_item {
@@ -209,17 +58,17 @@ async fn main() {
     info!("Starting further-ng...");
 
     let bot = Bot::from_env();
-    let audio_state = Arc::new(Mutex::new(AudioState::new().expect("Failed to initialize audio state")));
+    let audio_queue = Arc::new(Mutex::new(AudioQueue::new().expect("Failed to initialize audio queue")));
 
     // Set up audio completion handler
-    setup_audio_completion_handler(audio_state.clone(), bot.clone());
+    setup_audio_completion_handler(audio_queue.clone(), bot.clone());
 
     check_state(bot.clone(), NotifyState::Ready, args.clone()).await;
     info!("Bot is connected to Telegram API");
 
     let watchdog_task = tokio::spawn(watchdog(bot.clone(), args.clone()));
     let repl_task = {
-        let handler = Update::filter_message().endpoint(|bot: Bot, msg: Message, audio_state: Arc<Mutex<AudioState>>| async move {
+        let handler = Update::filter_message().endpoint(|bot: Bot, msg: Message, audio_queue: Arc<Mutex<AudioQueue>>| async move {
             let username = msg.from.clone().map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone())).unwrap_or_else(|| "Unknown".to_string());
 
             let cmd = FasterCommand::parse(msg.text().unwrap_or(""), bot.get_me().await?.username()).unwrap();
@@ -228,8 +77,8 @@ async fn main() {
                     bot.send_message(msg.chat.id, FasterCommand::descriptions().to_string()).await?;
                 }
                 FasterCommand::Queue => {
-                    let state = audio_state.lock().await;
-                    bot.send_message(msg.chat.id, state.get_queue_info()).await?;
+                    let queue = audio_queue.lock().await;
+                    bot.send_message(msg.chat.id, queue.get_queue_info()).await?;
                 }
                 FasterCommand::Play(url) => {
                     let msg_handle = bot.send_message(msg.chat.id, "Downloading audio...").await?;
@@ -241,7 +90,7 @@ async fn main() {
                         &url,
                     ).await {
                         Ok((audio_data, title, duration)) => {
-                            let mut state = audio_state.lock().await;
+                            let mut queue = audio_queue.lock().await;
                             
                             let item = QueueItem {
                                 url: url.clone(),
@@ -252,11 +101,11 @@ async fn main() {
                                 audio_data: audio_data.clone(),
                             };
                             
-                            let position = state.add_to_queue(item);
+                            let position = queue.add_to_queue(item);
                             
                             // If nothing is currently playing, start playback
-                            if !state.is_playing() {
-                                match state.play_next() {
+                            if !queue.is_playing() {
+                                match queue.play_next() {
                                     Ok(Some(item)) => {
                                         bot.send_message(msg.chat.id, format!("Added to queue (#{}). Now playing: {}", position, item.title)).await?;
                                         info!("Added to queue (#{}). Now playing: {}", position, item.title);
@@ -281,28 +130,28 @@ async fn main() {
                     }
                 }
                 FasterCommand::Stop => {
-                    let mut state = audio_state.lock().await;
-                    state.stop();
+                    let mut queue = audio_queue.lock().await;
+                    queue.stop();
                     bot.send_message(msg.chat.id, "Playback stopped").await?;
                 }
                 FasterCommand::Pause => {
-                    let state = audio_state.lock().await;
-                    state.pause();
+                    let queue = audio_queue.lock().await;
+                    queue.pause();
                     bot.send_message(msg.chat.id, "Playback paused").await?;
                 }
                 FasterCommand::Resume => {
-                    let state = audio_state.lock().await;
-                    state.resume();
+                    let queue = audio_queue.lock().await;
+                    queue.resume();
                     bot.send_message(msg.chat.id, "Playback resumed").await?;
                 }
                 FasterCommand::Clear => {
-                    let mut state = audio_state.lock().await;
-                    state.clear_queue();
+                    let mut queue = audio_queue.lock().await;
+                    queue.clear_queue();
                     bot.send_message(msg.chat.id, "Queue cleared").await?;
                 }
                 FasterCommand::Skip => {
-                    let mut state = audio_state.lock().await;
-                    match state.skip_current() {
+                    let mut queue = audio_queue.lock().await;
+                    match queue.skip_current() {
                         Ok(Some(item)) => {
                             bot.send_message(msg.chat.id, format!("Skipped! Now playing: {}", item.title)).await?;
                         }
@@ -315,11 +164,11 @@ async fn main() {
                     }
                 }
                 FasterCommand::Remove(index) => {
-                    let mut state = audio_state.lock().await;
-                    if index == 0 || index > state.queue_length() {
+                    let mut queue = audio_queue.lock().await;
+                    if index == 0 || index > queue.queue_length() {
                         bot.send_message(msg.chat.id, "Invalid queue position").await?;
                     } else {
-                        if let Some(removed_item) = state.remove_from_queue(index - 1) {
+                        if let Some(removed_item) = queue.remove_from_queue(index - 1) {
                             bot.send_message(msg.chat.id, format!("Removed: {}", removed_item.title)).await?;
                         } else {
                             bot.send_message(msg.chat.id, "Failed to remove item").await?;
@@ -327,8 +176,8 @@ async fn main() {
                     }
                 }
                 FasterCommand::NowPlaying => {
-                    let state = audio_state.lock().await;
-                    if let Some(item) = state.get_current_item() {
+                    let queue = audio_queue.lock().await;
+                    if let Some(item) = queue.get_current_item() {
                         let duration_str = item.duration
                             .map(|d| format!("{:02}:{:02}", d.as_secs() / 60, d.as_secs() % 60))
                             .unwrap_or_else(|| "??:??".to_string());
@@ -347,7 +196,7 @@ async fn main() {
         
         tokio::spawn(async move {
             Dispatcher::builder(bot, handler)
-                .dependencies(dptree::deps![audio_state])
+                .dependencies(dptree::deps![audio_queue])
                 .enable_ctrlc_handler()
                 .build()
                 .dispatch()
