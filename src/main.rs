@@ -259,7 +259,7 @@ async fn download_audio_with_progress(
             .expect("Failed to create runtime")
             .block_on(async move {
                 let executables_dir = PathBuf::from("libs");
-                let output_dir = PathBuf::from("/tmp/further-ng-cache");
+                let output_dir = PathBuf::from("/tmp/further-ng/yt-dlp/out/");
                 let mut fetcher = Youtube::with_new_binaries(executables_dir, output_dir)
                     .await
                     .map_err(|e| e.to_string())?;
